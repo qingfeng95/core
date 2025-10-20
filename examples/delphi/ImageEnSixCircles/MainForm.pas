@@ -5,12 +5,13 @@ interface
 uses
   Winapi.Windows, Winapi.Messages, System.SysUtils, System.Variants, System.Classes, System.Math,
   Vcl.Graphics, Vcl.Controls, Vcl.Forms, Vcl.Dialogs, Vcl.StdCtrls, Vcl.ExtCtrls, Vcl.FileCtrl,
-  IEView, ImageEnView, ImageEnIO, ImageEnProc, IEBitmap, IELayers, Types, Vcl.Imaging.pngimage;
+  IEView, ImageEnView, ImageEnIO, IEBitmap, Types, Vcl.Imaging.pngimage;
 
-// NOTE:
-// - This sample targets Delphi XE 10.3 (Rio) with ImageEn installed.
-// - Unit names may differ slightly depending on ImageEn version (IEView vs ImageEnView, etc.).
-// - Adjust uses and API names to your installed ImageEn version if necessary.
+// Delphi XE 10.3 + ImageEn (no layer properties required)
+// This version uses a single TImageEnView as a canvas (no layers),
+// manages six images' positions in memory, allows dragging to adjust
+// their visible area inside fixed circular regions, and exports the
+// final composition with horizontal mirror + negative effects.
 
 const
   CANVAS_WIDTH  = 8520;
@@ -30,13 +31,14 @@ const
     (X: 1926; Y: 3420), (X: 4260; Y: 3420), (X: 6594; Y: 3420)
   );
 
-type
+  SHORT_EDGE_TARGET = 1890; // scale short edge to 1890 px
+
+ type
   TPhotoSlot = record
-    Center: TPoint;
-    ImageLayerIdx: Integer; // index in ievMain.Layers
-    MaskLayerIdx: Integer;  // optional, if using layer mask
-    GuideLayerIdx: Integer; // ellipse outline for guidance
-    FileName: string;       // original path
+    Center: TPoint;   // circle center
+    FileName: string; // loaded file
+    Img: TBitmap;     // scaled image bitmap
+    LeftTop: TPoint;  // image top-left position on canvas
   end;
 
   TFormMain = class(TForm)
@@ -50,27 +52,30 @@ type
     OpenDialog1: TOpenDialog;
     ievMain: TImageEnView;
     procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
     procedure btnClearClick(Sender: TObject);
     procedure btnLoadClick(Sender: TObject);
     procedure btnExportClick(Sender: TObject);
     procedure chkStrictTangencyClick(Sender: TObject);
     procedure lstSlotsClick(Sender: TObject);
-    procedure ievMainLayerNotify(Sender: TObject; layer: Integer; event: TIELayerEvent);
+    procedure ievMainMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
+    procedure ievMainMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Integer);
+    procedure ievMainMouseUp(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
   private
     FSlots: array[0..5] of TPhotoSlot;
-    FMaskPreviewEnabled: Boolean;
+    FDragging: Boolean;
+    FActiveSlot: Integer;
+    FDragOffset: TPoint; // mouse pos relative to image top-left (in bitmap coords)
+
     procedure InitializeCanvas;
-    procedure BuildGuides;
     procedure UpdateCenters;
     procedure ClearAll;
+    procedure RedrawPreview;
     procedure LoadImages(const Files: TStrings);
     procedure LoadImageIntoSlot(const SlotIndex: Integer; const AFile: string);
     procedure EnsureCoverage(const SlotIndex: Integer);
     function  ActiveSlotIndex: Integer;
     procedure SelectSlot(const SlotIndex: Integer);
-
-    // Optional: Attach a shape mask layer to an image layer (API names may vary by ImageEn version)
-    procedure CreateAndAttachMaskLayer(const SlotIndex: Integer);
 
     // Export helpers
     procedure ExportFinalImage(const AFileName: string);
@@ -90,7 +95,7 @@ procedure TFormMain.FormCreate(Sender: TObject);
 var
   i: Integer;
 begin
-  // Init list
+  // Init list box labels
   lstSlots.Items.BeginUpdate;
   try
     lstSlots.Clear;
@@ -105,43 +110,37 @@ begin
   OpenDialog1.Options := OpenDialog1.Options + [ofAllowMultiSelect];
   OpenDialog1.Filter := 'Image Files|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.tiff|All Files|*.*';
 
-  // ImageEnView
-  ievMain.LayersEnabled := True;
-  ievMain.MouseInteractGeneral := ievMain.MouseInteractGeneral + [miMoveLayers];
-  ievMain.OnLayerNotify := ievMainLayerNotify;
+  // ImageEnView mouse interactions (no layer interactions required)
+  // Use official TIEMouseInteract items
+  ievMain.MouseInteract := [miZoom, miSmoothZoom, miScroll, miSelectZoom];
 
   // Default: use given centers (y: 945/3375)
   chkStrictTangency.Checked := False;
-  FMaskPreviewEnabled := False; // we use guide outlines; final mask applied on export
 
   InitializeCanvas;
   UpdateCenters;
-  BuildGuides;
+  RedrawPreview;
+end;
+
+procedure TFormMain.FormDestroy(Sender: TObject);
+var
+  i: Integer;
+begin
+  for i := 0 to 5 do
+    FreeAndNil(FSlots[i].Img);
 end;
 
 procedure TFormMain.InitializeCanvas;
-var
-  bg: TIELayer;
 begin
-  // Create background black canvas as base layer
+  // Prepare base canvas (IEBitmap) with black background
   ievMain.IEBitmap.SetSize(CANVAS_WIDTH, CANVAS_HEIGHT, ie32RGB);
   ievMain.IEBitmap.Fill(clBlack);
   ievMain.Update;
-
-  // Lock background layer (usually index 0)
-  if ievMain.LayersCount > 0 then
-  begin
-    bg := ievMain.Layers[0];
-    bg.Locked := True;
-    bg.Selectable := False;
-    bg.Name := 'Background';
-  end;
 end;
 
 procedure TFormMain.UpdateCenters;
 var
   i: Integer;
-  arr: PPoint;
 begin
   if chkStrictTangency.Checked then
   begin
@@ -153,71 +152,31 @@ begin
     for i := 0 to 5 do
       FSlots[i].Center := CENTERS_GIVEN[i];
   end;
-end;
 
-procedure TFormMain.BuildGuides;
-var
-  i, idx: Integer;
-  shp: TIEShapeLayer;
-  cx, cy: Integer;
-begin
-  // Remove old guide layers if any
+  // Re-center any loaded images onto their circles (preserve offsets if desired)
   for i := 0 to 5 do
-  begin
-    if (FSlots[i].GuideLayerIdx > 0) and (FSlots[i].GuideLayerIdx < ievMain.LayersCount) then
-      ievMain.LayersDelete(FSlots[i].GuideLayerIdx);
-    FSlots[i].GuideLayerIdx := -1;
-  end;
-
-  // Build 6 ellipse outline guides
-  for i := 0 to 5 do
-  begin
-    cx := FSlots[i].Center.X;
-    cy := FSlots[i].Center.Y;
-
-    idx := ievMain.LayersAdd(ielkShape);
-    shp := TIEShapeLayer(ievMain.Layers[idx]);
-    shp.Shape := ielsEllipse;
-    shp.Left := cx - CIRCLE_RADIUS;
-    shp.Top := cy - CIRCLE_RADIUS;
-    shp.Width := CIRCLE_DIAM;
-    shp.Height := CIRCLE_DIAM;
-    shp.FillColor := clNone;          // transparent fill
-    shp.FillOpacity := 0;
-    shp.PenWidth := 4;
-    shp.PenColor := clWhite;
-    shp.PenStyle := psSolid;          // change to psDash for dashed outline if desired
-    shp.Locked := True;
-    shp.Selectable := False;
-    shp.Name := Format('Guide%d', [i + 1]);
-
-    FSlots[i].GuideLayerIdx := idx;
-  end;
-
-  // Make sure guides are on top
-  ievMain.LayersReorderToTop(FSlots[5].GuideLayerIdx);
-  ievMain.Update;
+    if Assigned(FSlots[i].Img) then
+    begin
+      FSlots[i].LeftTop.X := FSlots[i].Center.X - FSlots[i].Img.Width div 2;
+      FSlots[i].LeftTop.Y := FSlots[i].Center.Y - FSlots[i].Img.Height div 2;
+      EnsureCoverage(i);
+    end;
 end;
 
 procedure TFormMain.ClearAll;
 var
   i: Integer;
 begin
-  // Clear all layers except background
-  while ievMain.LayersCount > 1 do
-    ievMain.LayersDelete(1);
-
   for i := 0 to 5 do
   begin
-    FSlots[i].ImageLayerIdx := -1;
-    FSlots[i].MaskLayerIdx := -1;
-    FSlots[i].GuideLayerIdx := -1;
+    FreeAndNil(FSlots[i].Img);
     FSlots[i].FileName := '';
+    FSlots[i].LeftTop := Point(0, 0);
   end;
 
   InitializeCanvas;
   UpdateCenters;
-  BuildGuides;
+  RedrawPreview;
 end;
 
 procedure TFormMain.btnClearClick(Sender: TObject);
@@ -242,170 +201,101 @@ begin
   for i := 0 to Min(5, Files.Count - 1) do
     LoadImageIntoSlot(i, Files[i]);
 
-  // Rebuild guides so they stay on top
-  BuildGuides;
-
   // Select first slot if available
   SelectSlot(0);
+
+  RedrawPreview;
 end;
 
 procedure TFormMain.LoadImageIntoSlot(const SlotIndex: Integer; const AFile: string);
 var
-  bmp: TIEBitmap;
-  imgIdx: Integer;
-  img: TIEImageLayer;
-  s: Double;
+  src, scaled: TBitmap;
   w, h, newW, newH: Integer;
+  s: Double;
   cx, cy: Integer;
-begin
-  if (SlotIndex < 0) or (SlotIndex > 5) then
-    Exit;
-
-  bmp := TIEBitmap.Create;
-  try
-    // Load image (adjust to your ImageEn version; Read/LoadFromFile/etc.)
-    try
-      bmp.Read(AFile);
-    except
-      bmp.LoadFromFile(AFile);
-    end;
-
-    w := bmp.Width;  h := bmp.Height;
-    if (w = 0) or (h = 0) then Exit;
-
-    // Scale: short edge -> 1890
-    s := 1890.0 / Min(w, h);
-    newW := Round(w * s);
-    newH := Round(h * s);
-    bmp.Resample(newW, newH, rfLanczos3);
-
-    // Create image layer and assign bitmap
-    imgIdx := ievMain.LayersAdd(ielkImage);
-    img := TIEImageLayer(ievMain.Layers[imgIdx]);
-    img.IEBitmap.Assign(bmp);
-
-    // Initial position: center to circle center
-    cx := FSlots[SlotIndex].Center.X;
-    cy := FSlots[SlotIndex].Center.Y;
-    img.Left := cx - img.Width div 2;
-    img.Top := cy - img.Height div 2;
-
-    img.Locked := False;
-    img.Selectable := True;
-    img.Resizable := False;  // disable resize; adjust if you want
-    img.Rotatable := False;  // disable rotate
-    img.Name := Format('Image%d', [SlotIndex + 1]);
-
-    FSlots[SlotIndex].ImageLayerIdx := imgIdx;
-    FSlots[SlotIndex].FileName := AFile;
-
-    // Optional: create a dedicated mask layer attached to this image layer (if supported by your ImageEn version)
-    // CreateAndAttachMaskLayer(SlotIndex);
-
-    // Enforce that the circle is fully covered
-    EnsureCoverage(SlotIndex);
-
-  finally
-    bmp.Free;
-  end;
-end;
-
-procedure TFormMain.CreateAndAttachMaskLayer(const SlotIndex: Integer);
-var
-  maskIdx: Integer;
-  m: TIEShapeLayer;
-  cx, cy: Integer;
-  imgIdx: Integer;
-  img: TIEImageLayer;
 begin
   if (SlotIndex < 0) or (SlotIndex > 5) then Exit;
-  imgIdx := FSlots[SlotIndex].ImageLayerIdx;
-  if (imgIdx < 0) or (imgIdx >= ievMain.LayersCount) then Exit;
-  img := TIEImageLayer(ievMain.Layers[imgIdx]);
 
-  // Create ellipse mask shape
-  maskIdx := ievMain.LayersAdd(ielkShape);
-  m := TIEShapeLayer(ievMain.Layers[maskIdx]);
-  cx := FSlots[SlotIndex].Center.X;
-  cy := FSlots[SlotIndex].Center.Y;
-  m.Shape := ielsEllipse;
-  m.Left := cx - CIRCLE_RADIUS;
-  m.Top := cy - CIRCLE_RADIUS;
-  m.Width := CIRCLE_DIAM;
-  m.Height := CIRCLE_DIAM;
-  m.FillColor := clWhite;  // mask area is white (visible)
-  m.PenStyle := psClear;   // no outline
-  m.Locked := True;
-  m.Selectable := False;
-  m.Name := Format('Mask%d', [SlotIndex + 1]);
+  FreeAndNil(FSlots[SlotIndex].Img);
+  FSlots[SlotIndex].FileName := '';
 
-  // Attach mask to image layer (the exact API may vary by ImageEn version)
-  // Some versions may provide: img.MaskLayer := maskIdx; or ievMain.LayersSetMask(imgIdx, maskIdx);
+  src := TBitmap.Create;
   try
-    img.MaskLayer := maskIdx; // adjust to your version if needed
-  except
-    // If your version uses a different API, set it here, e.g.:
-    // ievMain.LayersSetMask(imgIdx, maskIdx);
-  end;
+    // Load via VCL bitmap (supports BMP/JPG/PNG if JPEG/PNG units are in uses; we have PNG unit)
+    src.PixelFormat := pf32bit;
+    src.LoadFromFile(AFile);
 
-  FSlots[SlotIndex].MaskLayerIdx := maskIdx;
+    w := src.Width; h := src.Height;
+    if (w = 0) or (h = 0) then Exit;
+
+    // Scale short edge to 1890
+    s := SHORT_EDGE_TARGET / Min(w, h);
+    newW := Round(w * s);
+    newH := Round(h * s);
+
+    scaled := TBitmap.Create;
+    try
+      scaled.PixelFormat := pf32bit;
+      scaled.SetSize(newW, newH);
+      SetStretchBltMode(scaled.Canvas.Handle, HALFTONE);
+      StretchBlt(scaled.Canvas.Handle, 0, 0, newW, newH, src.Canvas.Handle, 0, 0, w, h, SRCCOPY);
+
+      FSlots[SlotIndex].Img := TBitmap.Create;
+      FSlots[SlotIndex].Img.Assign(scaled);
+      FSlots[SlotIndex].FileName := AFile;
+
+      // Initial position: center to circle center
+      cx := FSlots[SlotIndex].Center.X;
+      cy := FSlots[SlotIndex].Center.Y;
+      FSlots[SlotIndex].LeftTop.X := cx - FSlots[SlotIndex].Img.Width div 2;
+      FSlots[SlotIndex].LeftTop.Y := cy - FSlots[SlotIndex].Img.Height div 2;
+      EnsureCoverage(SlotIndex);
+    finally
+      scaled.Free;
+    end;
+  finally
+    src.Free;
+  end;
 end;
 
 procedure TFormMain.EnsureCoverage(const SlotIndex: Integer);
 var
-  imgIdx: Integer;
-  img: TIEImageLayer;
   cx, cy: Integer;
-  L, T_, R, B: Integer;
   minLeft, maxLeft, minTop, maxTop: Integer;
+  Img: TBitmap;
 begin
   if (SlotIndex < 0) or (SlotIndex > 5) then Exit;
-  imgIdx := FSlots[SlotIndex].ImageLayerIdx;
-  if (imgIdx < 0) or (imgIdx >= ievMain.LayersCount) then Exit;
+  Img := FSlots[SlotIndex].Img;
+  if not Assigned(Img) then Exit;
 
-  img := TIEImageLayer(ievMain.Layers[imgIdx]);
   cx := FSlots[SlotIndex].Center.X;
   cy := FSlots[SlotIndex].Center.Y;
 
-  // For full coverage of circle (radius 900), enforce image rect covers [cx-r, cy-r] .. [cx+r, cy+r]
+  // Ensure the circle (radius 900) is fully covered by the image rect
   // Allowed left range: [cx + r - img.Width, cx - r]
-  minLeft := cx + CIRCLE_RADIUS - img.Width;
+  minLeft := cx + CIRCLE_RADIUS - Img.Width;
   maxLeft := cx - CIRCLE_RADIUS;
-  if img.Left < minLeft then img.Left := minLeft;
-  if img.Left > maxLeft then img.Left := maxLeft;
+  if FSlots[SlotIndex].LeftTop.X < minLeft then FSlots[SlotIndex].LeftTop.X := minLeft;
+  if FSlots[SlotIndex].LeftTop.X > maxLeft then FSlots[SlotIndex].LeftTop.X := maxLeft;
 
   // Allowed top range: [cy + r - img.Height, cy - r]
-  minTop := cy + CIRCLE_RADIUS - img.Height;
+  minTop := cy + CIRCLE_RADIUS - Img.Height;
   maxTop := cy - CIRCLE_RADIUS;
-  if img.Top < minTop then img.Top := minTop;
-  if img.Top > maxTop then img.Top := maxTop;
-
-  ievMain.Update;
+  if FSlots[SlotIndex].LeftTop.Y < minTop then FSlots[SlotIndex].LeftTop.Y := minTop;
+  if FSlots[SlotIndex].LeftTop.Y > maxTop then FSlots[SlotIndex].LeftTop.Y := maxTop;
 end;
 
 function TFormMain.ActiveSlotIndex: Integer;
-var
-  i: Integer;
-  idx: Integer;
 begin
   Result := lstSlots.ItemIndex;
-  if (Result >= 0) and (Result < 6) then Exit;
-
-  // fallback: find by current layer
-  idx := ievMain.CurrentLayer;
-  for i := 0 to 5 do
-    if FSlots[i].ImageLayerIdx = idx then
-      Exit(i);
-
-  Result := 0;
+  if (Result < 0) or (Result > 5) then
+    Result := 0;
 end;
 
 procedure TFormMain.SelectSlot(const SlotIndex: Integer);
 begin
   if (SlotIndex < 0) or (SlotIndex > 5) then Exit;
   lstSlots.ItemIndex := SlotIndex;
-  if (FSlots[SlotIndex].ImageLayerIdx >= 0) and (FSlots[SlotIndex].ImageLayerIdx < ievMain.LayersCount) then
-    ievMain.CurrentLayer := FSlots[SlotIndex].ImageLayerIdx;
 end;
 
 procedure TFormMain.lstSlotsClick(Sender: TObject);
@@ -416,24 +306,120 @@ end;
 procedure TFormMain.chkStrictTangencyClick(Sender: TObject);
 begin
   UpdateCenters;
-  BuildGuides;
-  // Re-enforce coverage since the circle may shift vertically
-  EnsureCoverage(ActiveSlotIndex);
+  RedrawPreview;
 end;
 
-procedure TFormMain.ievMainLayerNotify(Sender: TObject; layer: Integer; event: TIELayerEvent);
+procedure TFormMain.ievMainMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
 var
+  bx, by: Integer;
   i: Integer;
+  dx, dy: Integer;
 begin
-  // When a layer moves, if it is one of the image layers, keep coverage
-  if event = ielChanged then
-  begin
-    for i := 0 to 5 do
-      if FSlots[i].ImageLayerIdx = layer then
+  if Button <> mbLeft then Exit;
+
+  // Convert screen coords to bitmap coords using ImageEn helpers
+  bx := ievMain.XScr2Bmp(X);
+  by := ievMain.YScr2Bmp(Y);
+
+  // Find which circle was clicked
+  FActiveSlot := -1;
+  for i := 0 to 5 do
+    if Assigned(FSlots[i].Img) then
+    begin
+      dx := bx - FSlots[i].Center.X;
+      dy := by - FSlots[i].Center.Y;
+      if (dx * dx + dy * dy) <= (CIRCLE_RADIUS * CIRCLE_RADIUS) then
       begin
-        EnsureCoverage(i);
+        FActiveSlot := i;
         Break;
       end;
+    end;
+
+  if FActiveSlot >= 0 then
+  begin
+    FDragging := True;
+    FDragOffset.X := bx - FSlots[FActiveSlot].LeftTop.X;
+    FDragOffset.Y := by - FSlots[FActiveSlot].LeftTop.Y;
+    SelectSlot(FActiveSlot);
+  end;
+end;
+
+procedure TFormMain.ievMainMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Integer);
+var
+  bx, by: Integer;
+begin
+  if not FDragging then Exit;
+  bx := ievMain.XScr2Bmp(X);
+  by := ievMain.YScr2Bmp(Y);
+
+  if (FActiveSlot >= 0) and (FActiveSlot <= 5) and Assigned(FSlots[FActiveSlot].Img) then
+  begin
+    FSlots[FActiveSlot].LeftTop.X := bx - FDragOffset.X;
+    FSlots[FActiveSlot].LeftTop.Y := by - FDragOffset.Y;
+    EnsureCoverage(FActiveSlot);
+    RedrawPreview;
+  end;
+end;
+
+procedure TFormMain.ievMainMouseUp(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
+begin
+  if Button = mbLeft then
+    FDragging := False;
+end;
+
+procedure TFormMain.RedrawPreview;
+var
+  dest: TBitmap;
+  i: Integer;
+  cx, cy, r: Integer;
+  Rgn: HRGN;
+begin
+  dest := TBitmap.Create;
+  try
+    dest.PixelFormat := pf32bit;
+    dest.SetSize(CANVAS_WIDTH, CANVAS_HEIGHT);
+    dest.Canvas.Brush.Color := clBlack;
+    dest.Canvas.FillRect(Rect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT));
+
+    // Draw each image clipped to its circle
+    for i := 0 to 5 do
+      if Assigned(FSlots[i].Img) then
+      begin
+        cx := FSlots[i].Center.X;
+        cy := FSlots[i].Center.Y;
+        r := CIRCLE_RADIUS;
+
+        Rgn := CreateEllipticRgn(cx - r, cy - r, cx + r, cy + r);
+        try
+          SelectClipRgn(dest.Canvas.Handle, Rgn);
+          SetStretchBltMode(dest.Canvas.Handle, HALFTONE);
+          BitBlt(dest.Canvas.Handle,
+                 FSlots[i].LeftTop.X, FSlots[i].LeftTop.Y,
+                 FSlots[i].Img.Width, FSlots[i].Img.Height,
+                 FSlots[i].Img.Canvas.Handle, 0, 0, SRCCOPY);
+        finally
+          SelectClipRgn(dest.Canvas.Handle, 0);
+          DeleteObject(Rgn);
+        end;
+      end;
+
+    // Draw guide circles (white outline)
+    dest.Canvas.Brush.Style := bsClear;
+    dest.Canvas.Pen.Color := clWhite;
+    dest.Canvas.Pen.Width := 4;
+    for i := 0 to 5 do
+    begin
+      cx := FSlots[i].Center.X;
+      cy := FSlots[i].Center.Y;
+      r := CIRCLE_RADIUS;
+      dest.Canvas.Ellipse(cx - r, cy - r, cx + r, cy + r);
+    end;
+
+    // Assign to ImageEnView
+    ievMain.IEBitmap.AssignFromBitmap(dest);
+    ievMain.Update;
+  finally
+    dest.Free;
   end;
 end;
 
@@ -461,11 +447,9 @@ end;
 procedure TFormMain.MirrorHorizontalBitmap(B: TBitmap);
 var
   y, x: Integer;
-  pRow: PByte;
   tmp: array of byte;
   wBytes: Integer;
 begin
-  // Assumes pf32bit
   B.PixelFormat := pf32bit;
   wBytes := B.Width * 4;
   SetLength(tmp, wBytes);
@@ -481,24 +465,18 @@ procedure TFormMain.NegativeBitmap(B: TBitmap);
 var
   x, y: Integer;
   p: PByte;
-  c: array[0..3] of byte;
 begin
-  // Invert RGB channels; keep alpha if present
   B.PixelFormat := pf32bit;
   for y := 0 to B.Height - 1 do
   begin
     p := B.Scanline[y];
     for x := 0 to B.Width - 1 do
     begin
-      // Pixel format is BGRA in VCL
-      p^ := 255 - p^;           // B
-      Inc(p);
-      p^ := 255 - p^;           // G
-      Inc(p);
-      p^ := 255 - p^;           // R
-      Inc(p);
-      // Alpha
-      Inc(p);
+      // BGRA order in VCL
+      p^ := 255 - p^; Inc(p); // B
+      p^ := 255 - p^; Inc(p); // G
+      p^ := 255 - p^; Inc(p); // R
+      Inc(p);                 // A
     end;
   end;
 end;
@@ -508,104 +486,58 @@ var
   dest: TBitmap;
   i: Integer;
   cx, cy, r: Integer;
-  imgIdx: Integer;
-  img: TIEImageLayer;
-  src, scaled: TBitmap;
   Rgn: HRGN;
-  oldRgn: HRGN;
-  destRect: TRect;
-  sIE: TIEBitmap;
-  Png: TPngImage;
+  tmp: TBitmap;
 begin
   dest := TBitmap.Create;
   try
-    dest.SetSize(CANVAS_WIDTH, CANVAS_HEIGHT);
     dest.PixelFormat := pf32bit;
+    dest.SetSize(CANVAS_WIDTH, CANVAS_HEIGHT);
     dest.Canvas.Brush.Color := clBlack;
     dest.Canvas.FillRect(Rect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT));
 
     for i := 0 to 5 do
-    begin
-      cx := FSlots[i].Center.X;
-      cy := FSlots[i].Center.Y;
-      r := CIRCLE_RADIUS;
-
-      imgIdx := FSlots[i].ImageLayerIdx;
-      if (imgIdx < 0) or (imgIdx >= ievMain.LayersCount) then
-        Continue;
-      img := TIEImageLayer(ievMain.Layers[imgIdx]);
-
-      // Obtain a bitmap for the current image layer
-      src := TBitmap.Create;
-      try
-        src.PixelFormat := pf32bit;
-        // Try to copy from IEBitmap directly
+      if Assigned(FSlots[i].Img) then
+      begin
+        // Prepare a copy for transformation (mirror + negative)
+        tmp := TBitmap.Create;
         try
-          sIE := TIEBitmap.Create;
-          try
-            sIE.Assign(img.IEBitmap);
-            sIE.AssignToBitmap(src);
-          finally
-            sIE.Free;
-          end;
-        except
-          // Fallback: load original file and resample to current size
-          src.LoadFromFile(FSlots[i].FileName);
-          // Create scaled copy to match layer size
-          scaled := TBitmap.Create;
-          try
-            scaled.PixelFormat := pf32bit;
-            scaled.SetSize(img.Width, img.Height);
-            SetStretchBltMode(scaled.Canvas.Handle, HALFTONE);
-            StretchBlt(scaled.Canvas.Handle, 0, 0, scaled.Width, scaled.Height,
-                       src.Canvas.Handle, 0, 0, src.Width, src.Height, SRCCOPY);
-            src.Assign(scaled);
-          finally
-            scaled.Free;
-          end;
-        end;
+          tmp.PixelFormat := pf32bit;
+          tmp.SetSize(FSlots[i].Img.Width, FSlots[i].Img.Height);
+          BitBlt(tmp.Canvas.Handle, 0, 0, tmp.Width, tmp.Height, FSlots[i].Img.Canvas.Handle, 0, 0, SRCCOPY);
 
-        // Apply Horizontal Mirror and Negative
-        MirrorHorizontalBitmap(src);
-        NegativeBitmap(src);
+          MirrorHorizontalBitmap(tmp);
+          NegativeBitmap(tmp);
 
-        // Clip to ellipse and draw at image layer position
-        Rgn := CreateEllipticRgn(cx - r, cy - r, cx + r, cy + r);
-        try
-          // Set clipping region
-          SelectClipRgn(dest.Canvas.Handle, Rgn);
-          // Draw at (img.Left, img.Top)
-          destRect := Rect(img.Left, img.Top, img.Left + src.Width, img.Top + src.Height);
-          SetStretchBltMode(dest.Canvas.Handle, HALFTONE);
-          StretchBlt(dest.Canvas.Handle,
-                     destRect.Left, destRect.Top, destRect.Width, destRect.Height,
-                     src.Canvas.Handle, 0, 0, src.Width, src.Height, SRCCOPY);
+          cx := FSlots[i].Center.X;
+          cy := FSlots[i].Center.Y;
+          r := CIRCLE_RADIUS;
+
+          Rgn := CreateEllipticRgn(cx - r, cy - r, cx + r, cy + r);
+          try
+            SelectClipRgn(dest.Canvas.Handle, Rgn);
+            SetStretchBltMode(dest.Canvas.Handle, HALFTONE);
+            BitBlt(dest.Canvas.Handle,
+                   FSlots[i].LeftTop.X, FSlots[i].LeftTop.Y,
+                   tmp.Width, tmp.Height,
+                   tmp.Canvas.Handle, 0, 0, SRCCOPY);
+          finally
+            SelectClipRgn(dest.Canvas.Handle, 0);
+            DeleteObject(Rgn);
+          end;
         finally
-          // Reset clip
-          SelectClipRgn(dest.Canvas.Handle, 0);
-          DeleteObject(Rgn);
+          tmp.Free;
         end;
-
-      finally
-        src.Free;
       end;
-    end;
 
-    // Save as PNG using VCL
-    {$IF CompilerVersion >= 23.0} // XE2+
-    var Png: Vcl.Imaging.pngimage.TPngImage;
-    {$IFEND}
-    {$IF CompilerVersion >= 23.0}
-    Png := Vcl.Imaging.pngimage.TPngImage.Create;
+    // Save as PNG (using VCL PNG)
+    with TPngImage.Create do
     try
-      Png.Assign(dest);
-      Png.SaveToFile(AFileName);
+      Assign(dest);
+      SaveToFile(AFileName);
     finally
-      Png.Free;
+      Free;
     end;
-    {$ELSE}
-    dest.SaveToFile(AFileName); // fallback: BMP
-    {$IFEND}
 
     ShowMessage('Exported: ' + AFileName);
   finally

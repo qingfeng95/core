@@ -81,6 +81,9 @@ object FormMain: TFormMain
     Height = 644
     Align = alClient
     TabOrder = 2
+    OnMouseDown = ievMainMouseDown
+    OnMouseMove = ievMainMouseMove
+    OnMouseUp = ievMainMouseUp
   end
   object OpenDialog1: TOpenDialog
     Left = 984
